@@ -3,15 +3,7 @@ services:
     build: .
     volumes:
       - .:/app
-    environment:
-      - SCRAPER_API_URL=http://scraper-api:3000
     stdin_open: true
     tty: true
-    depends_on:
-      - scraper-api
-
-  scraper-api:
-    build: ./scraper-api-repo # O Docker vai ler a pasta local
-    ports:
-      - "3000:3000"
-    restart: always
+    environment:
+      - GOOGLE_BOOKS_API_KEY=${GOOGLE_BOOKS_API_KEY}

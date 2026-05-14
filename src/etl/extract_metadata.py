@@ -1,78 +1,75 @@
 import pandas as pd
-import requests
-import time
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
 import os
 
-def fetch_metadata():
-    input_path = 'data/processed/cleaned_books.csv'
-    output_path = 'data/processed/enriched_books.csv'
-    
-    if not os.path.exists(input_path):
-        print("Erro: cleaned_books.csv não encontrado. Executa o transform.py primeiro.")
+def generate_external_recommendations():
+    # Caminhos dos arquivos
+    my_books_path = 'data/processed/enriched_books.csv'
+    kaggle_books_path = 'data/raw/book_data.csv' # Verifique o nome exato do CSV que você baixou
+
+    if not os.path.exists(my_books_path) or not os.path.exists(kaggle_books_path):
+        print("Erro: Verifique se os arquivos CSV estão nas pastas corretas.")
         return
 
-    df = pd.read_csv(input_path)
+    # 1. Carregar seus dados e filtrar favoritos (Notas 4 e 5)
+    meus_livros = pd.read_csv(my_books_path)
+    meus_favs = meus_livros[meus_livros['My Rating'] >= 4].copy()
     
-    # Filtramos os teus favoritos (notas 4 e 5)
-    # Exemplos: Witch Hat Atelier e Sakamoto Days
-    favoritos = df[df['My Rating'] >= 4].copy()
-    
-    # A URL agora aponta para o nome do serviço no Docker Compose
-    # De acordo com o README, os endpoints começam com /api
-    base_url = os.getenv('SCRAPER_API_URL', 'http://scraper-api:3000/api')
-    
-    metadata_list = []
-    print(f"Iniciando enriquecimento de {len(favoritos)} livros...")
+    # Criar 'sopa de tags' para seus livros
+    meus_favs['metadata'] = (meus_favs['Author'].fillna('') + ' ' + 
+                            meus_favs['All_Tags'].fillna('')).str.lower()
 
-    for index, row in favoritos.iterrows():
-        book_id = str(row['Book Id'])
-        print(f"-> A processar: {row['Title']} (ID: {book_id})")
-        
+    # 2. Carregar dataset do Kaggle (usando uma amostra para performance)
+    # 100.000 linhas costumam ser seguras para a maioria dos PCs pessoais
+    externo = pd.read_csv(kaggle_books_path, nrows=100000)
+    
+    # Ajuste os nomes das colunas conforme o seu dataset do Kaggle (ex: 'book_title', 'genres', 'author')
+    # Vou usar nomes genéricos, verifique as colunas do seu arquivo!
+    externo['metadata'] = (externo['author'].fillna('') + ' ' + 
+                          externo['genres'].fillna('')).str.lower()
+
+    # 3. Unir bases para o cálculo
+    # Marcamos o que é seu e o que é externo
+    meus_favs['source'] = 'meu'
+    externo['source'] = 'kaggle'
+    
+    df_total = pd.concat([
+        meus_favs[['Title', 'metadata', 'source']], 
+        externo[['book_title', 'metadata', 'source']].rename(columns={'book_title': 'Title'})
+    ], ignore_index=True)
+
+    # 4. Vetorização TF-IDF
+    tfidf = TfidfVectorizer(stop_words='english')
+    tfidf_matrix = tfidf.fit_transform(df_total['metadata'].fillna(''))
+
+    # 5. Função de recomendação
+    def recommend_new_stuff(book_title):
         try:
-            # Novo endpoint conforme o README: /api/book/details/:id
-            response = requests.get(f"{base_url}/book/details/{book_id}", timeout=15)
+            # Encontra o índice do seu livro na base total
+            idx = df_total[df_total['Title'] == book_title].index[0]
             
-            if response.status_code == 200:
-                json_data = response.json()
-                
-                # O README diz que o formato é: {"success": true, "data": {...}}
-                if json_data.get('success') and json_data.get('data'):
-                    book_data = json_data['data']
-                    
-                    # Extraímos os géneros (genres) e a descrição
-                    # Nota: os nomes das chaves dependem do que a API retorna no campo 'data'
-                    description = book_data.get('description', '')
-                    genres = book_data.get('genres', []) # Lista de géneros
-                    
-                    metadata_list.append({
-                        'Book Id': int(book_id),
-                        'Description': description,
-                        'Genres': "|".join(genres) if isinstance(genres, list) else str(genres)
-                    })
-                else:
-                    print(f"API retornou erro para o livro {book_id}")
-            else:
-                print(f"Erro na API: Status {response.status_code}")
-                
+            # Calcula similaridade apenas para esse livro (linear_kernel é mais rápido)
+            cosine_sim = linear_kernel(tfidf_matrix[idx], tfidf_matrix).flatten()
+            
+            # Pega os índices mais similares
+            sim_indices = cosine_sim.argsort()[::-1]
+            
+            # Filtra para retornar APENAS livros que estão na base do Kaggle (que você não leu)
+            recoms = []
+            for i in sim_indices:
+                if df_total.iloc[i]['source'] == 'kaggle':
+                    recoms.append(df_total.iloc[i]['Title'])
+                if len(recoms) >= 5: break
+            
+            return recoms
         except Exception as e:
-            print(f"Falha na requisição: {e}")
-        
-        # Delay para não sobrecarregar a API local e evitar erros de timeout
-        time.sleep(0.5)
+            return f"Erro: {e}"
 
-    # Converter resultados para DataFrame e unir com os teus favoritos
-    enriched_results_df = pd.DataFrame(metadata_list)
-    
-    if not enriched_results_df.empty:
-        # Fazemos o merge para garantir que não perdemos as colunas originais do CSV
-        final_df = favoritos.merge(enriched_results_df, on='Book Id', how='left')
-        
-        os.makedirs('data/processed', exist_ok=True)
-        final_df.to_csv(output_path, index=False)
-        print(f"\nSucesso! {len(enriched_results_df)} livros enriquecidos.")
-        print(f"Ficheiro guardado em: {output_path}")
-    else:
-        print("\nNenhum dado foi recuperado da API.")
+    # Teste com um favorito seu
+    exemplo = meus_favs.iloc[0]['Title']
+    print(f"\nSe você gostou de '{exemplo}', talvez goste de:")
+    print(recommend_new_stuff(exemplo))
 
 if __name__ == "__main__":
-    fetch_metadata()
+    generate_external_recommendations()
